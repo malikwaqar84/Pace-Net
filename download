@@ -1,0 +1,201 @@
+"""
+Unit Tests for PACE-Net Components
+=====================================
+Run: pytest tests/test_models.py -v
+"""
+
+import sys, pytest, torch
+import numpy as np
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from models.sfg_transformer import SFGTransformer
+from models.gpg_transformer import GPGTransformer, SWAGatingModule
+from models.bcg_transformer import BCGTransformer
+from models.cgat import GlymphaticGatedCrossAttention, CGATFusion
+from models.diffpool import HierarchicalDiffPool
+from models.neural_scm import NeuralSCM
+from utils.losses import FocalLoss, PACENetLoss
+from utils.metrics import compute_metrics
+
+
+# ─── Fixtures ─────────────────────────────────────────────────────────────────
+N_S  = 16   # sleep nodes (8 channel + 8 biomarker)
+N_C  = 50   # brain ROIs (reduced for testing)
+N_PVS = 24  # PVS nodes
+N_E  = 100  # edges
+B    = 4    # batch size
+D_S  = 128  # sleep hidden dim
+D_C  = 256  # brain hidden dim
+D_G  = 64   # glymphatic hidden dim
+
+
+# ─── SFG Tests ────────────────────────────────────────────────────────────────
+class TestSFGTransformer:
+    def test_output_shape(self):
+        model = SFGTransformer(node_feat_dim=32, hidden_dim=D_S,
+                               n_layers=2, n_heads=4)
+        x = torch.randn(N_S, 32)
+        edge_index = torch.randint(0, N_S, (2, N_E))
+        edge_attr  = torch.rand(N_E)
+        band_ids   = torch.randint(0, 5, (N_E,))
+        stage_ids  = torch.randint(0, 5, (N_S,))
+        h = model(x, edge_index, edge_attr, band_ids, stage_ids)
+        assert h.shape == (N_S, D_S), f"Expected ({N_S},{D_S}), got {h.shape}"
+
+    def test_no_nan(self):
+        model = SFGTransformer(node_feat_dim=32, hidden_dim=D_S,
+                               n_layers=2, n_heads=4)
+        x = torch.randn(N_S, 32)
+        edge_index = torch.randint(0, N_S, (2, N_E))
+        edge_attr  = torch.rand(N_E)
+        band_ids   = torch.randint(0, 5, (N_E,))
+        stage_ids  = torch.randint(0, 5, (N_S,))
+        h = model(x, edge_index, edge_attr, band_ids, stage_ids)
+        assert not torch.isnan(h).any(), "NaN values in SFG output"
+
+
+# ─── GPG Tests ────────────────────────────────────────────────────────────────
+class TestGPGTransformer:
+    def test_output_shapes(self):
+        model = GPGTransformer(node_feat_dim=12, hidden_dim=D_G,
+                               n_layers=2, n_heads=2,
+                               n_pvs_nodes=N_PVS, n_brain_rois=N_C)
+        x = torch.randn(N_PVS, 12)
+        edge_index = torch.randint(0, N_PVS, (2, 50))
+        w_struct   = torch.rand(50)
+        z_swa      = torch.rand(B, 1)
+        h_G, G_glyph, z_G = model(x, edge_index, w_struct, z_swa)
+        assert h_G.shape    == (N_PVS, D_G)
+        assert G_glyph.shape == (N_PVS, N_C)
+        assert z_G.shape[1] == D_G
+
+    def test_swa_gating(self):
+        """SWA gate values should be in (0, 1) — sigmoid output."""
+        gate = SWAGatingModule(swa_dim=1, hidden_dim=16)
+        w = torch.rand(50)
+        z_swa = torch.rand(B, 1)
+        w_gated = gate(w, z_swa)
+        assert (w_gated >= 0).all() and (w_gated <= w.max() + 1e-4).all()
+
+
+# ─── BCG Tests ────────────────────────────────────────────────────────────────
+class TestBCGTransformer:
+    def test_output_shape(self):
+        model = BCGTransformer(node_feat_dim=20, hidden_dim=D_C,
+                               n_layers=2, n_heads=4, n_stages=4)
+        x = torch.randn(N_C, 20)
+        edge_index  = torch.randint(0, N_C, (2, N_E))
+        sc_mask     = torch.rand(N_E).round()
+        fc_weights  = torch.rand(N_E)
+        h = model(x,
+                  [edge_index]*4, [sc_mask]*4, [fc_weights]*4)
+        assert h.shape == (N_C, D_C), f"Expected ({N_C},{D_C}), got {h.shape}"
+
+
+# ─── CGAT Tests ───────────────────────────────────────────────────────────────
+class TestCGAT:
+    def test_cross_attention_shape(self):
+        attn = GlymphaticGatedCrossAttention(
+            sleep_dim=D_S, brain_dim=D_S, n_heads=4)
+        H_S = torch.randn(N_S, D_S)
+        H_C = torch.randn(N_C, D_S)
+        G   = torch.rand(N_S, N_C)
+        H_S_new, attn_map = attn(H_S, H_C, G)
+        assert H_S_new.shape == (N_S, D_S)
+        assert attn_map.shape == (N_S, N_C)
+
+    def test_ablation_no_gating(self):
+        """Without gating, attention should differ from gated version."""
+        attn = GlymphaticGatedCrossAttention(
+            sleep_dim=D_S, brain_dim=D_S, n_heads=4)
+        H_S = torch.randn(N_S, D_S)
+        H_C = torch.randn(N_C, D_S)
+        G   = torch.rand(N_S, N_C) * 0.1  # Very sparse gate
+
+        with torch.no_grad():
+            h_gated, _   = attn(H_S, H_C, G, use_glymphatic_gating=True)
+            h_ungated, _ = attn(H_S, H_C, G, use_glymphatic_gating=False)
+
+        # Should not be equal when gate is very sparse
+        assert not torch.allclose(h_gated, h_ungated, atol=1e-3)
+
+    def test_cgat_fusion_shape(self):
+        fusion = CGATFusion(sleep_dim=D_S, brain_dim=D_C, glyph_dim=D_G,
+                            out_dim=D_C, n_heads=4)
+        H_S = torch.randn(N_S, D_S)
+        H_C = torch.randn(N_C, D_C)
+        H_G = torch.randn(N_PVS, D_G)
+        G   = torch.rand(N_S, N_C)
+        z_fused, attn_map = fusion(H_S, H_C, H_G, G)
+        assert z_fused.shape == (D_C,)
+        assert attn_map.shape == (N_S, N_C)
+
+
+# ─── DiffPool Tests ───────────────────────────────────────────────────────────
+class TestDiffPool:
+    def test_output_shape(self):
+        pool = HierarchicalDiffPool(in_dim=D_C, hidden_dim=D_C,
+                                    n_clusters_1=7, n_clusters_2=1)
+        x   = torch.randn(B, N_C, D_C)
+        adj = torch.rand(B, N_C, N_C)
+        z_C, loss = pool(x, adj)
+        assert z_C.shape == (B, D_C), f"Expected ({B},{D_C}), got {z_C.shape}"
+        assert not torch.isnan(z_C).any()
+        assert loss.item() >= 0
+
+
+# ─── Loss Tests ───────────────────────────────────────────────────────────────
+class TestLosses:
+    def test_focal_loss(self):
+        fl = FocalLoss(gamma=2.0)
+        logits  = torch.randn(B, 3)
+        targets = torch.randint(0, 3, (B,))
+        loss = fl(logits, targets)
+        assert loss.item() > 0
+        assert not torch.isnan(loss)
+
+    def test_composite_loss(self):
+        criterion = PACENetLoss(lambda_ce=1.0, lambda_mse=0.4,
+                                lambda_struct=0.6, lambda_cf=0.2)
+        logits    = torch.randn(B, 3)
+        targets   = torch.randint(0, 3, (B,))
+        mmse_pred = torch.rand(B, 1)
+        mmse_true = torch.rand(B, 1) * 30
+        z_G_pred  = torch.randn(B, 64)
+        z_G_obs   = torch.randn(B, 64)
+        z_C_pred  = torch.randn(B, 256)
+        z_C_obs   = torch.randn(B, 256)
+        cf_z_C    = torch.randn(B, 128)
+        cn_mean   = torch.zeros(128)
+
+        ld = criterion(logits, targets, mmse_pred, mmse_true,
+                       z_G_pred, z_G_obs, z_C_pred, z_C_obs,
+                       cf_z_C, cn_mean)
+        assert 'total' in ld
+        assert 'ce' in ld
+        assert ld['total'].item() > 0
+
+
+# ─── Metrics Tests ────────────────────────────────────────────────────────────
+class TestMetrics:
+    def test_perfect_prediction(self):
+        y = np.array([0, 1, 2, 0, 1, 2])
+        m = compute_metrics(y, y)
+        assert m['accuracy'] == 100.0
+        assert m['mcc'] == pytest.approx(1.0, abs=1e-6)
+        assert m['jaccard'] == pytest.approx(1.0, abs=1e-6)
+        assert m['cohen_kappa'] == pytest.approx(1.0, abs=1e-6)
+
+    def test_random_prediction(self):
+        np.random.seed(42)
+        y_true = np.random.randint(0, 3, 100)
+        y_pred = np.random.randint(0, 3, 100)
+        m = compute_metrics(y_true, y_pred)
+        # Random should be ~33% accuracy, MCC near 0
+        assert 0 < m['accuracy'] < 100
+        assert -1 <= m['mcc'] <= 1
+
+
+if __name__ == '__main__':
+    pytest.main([__file__, '-v', '--tb=short'])

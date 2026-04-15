@@ -1,0 +1,129 @@
+"""
+Evaluation Metrics for PACE-Net
+================================
+Computes all metrics reported in the paper:
+  Accuracy, Sensitivity, Specificity, F1, AUC-ROC,
+  MCC (Matthews Correlation Coefficient), Jaccard, Cohen's κ
+"""
+
+import torch
+import numpy as np
+from sklearn.metrics import (
+    accuracy_score, f1_score, roc_auc_score,
+    matthews_corrcoef, jaccard_score, cohen_kappa_score,
+    confusion_matrix, classification_report
+)
+from typing import Dict, Optional
+
+
+def compute_metrics(y_true: np.ndarray,
+                    y_pred: np.ndarray,
+                    y_proba: Optional[np.ndarray] = None,
+                    class_names: list = ['CN', 'MCI', 'AD']) -> Dict[str, float]:
+    """
+    Compute all classification metrics.
+
+    Args:
+        y_true:  (N,) ground-truth labels
+        y_pred:  (N,) predicted labels
+        y_proba: (N, n_classes) predicted probabilities (for AUC)
+        class_names: list of class names
+    Returns:
+        metrics: dictionary of all computed metrics
+    """
+    metrics = {}
+
+    # Basic accuracy
+    metrics['accuracy'] = accuracy_score(y_true, y_pred) * 100
+
+    # Macro F1
+    metrics['f1_macro'] = f1_score(y_true, y_pred, average='macro') * 100
+    metrics['f1_weighted'] = f1_score(y_true, y_pred, average='weighted') * 100
+
+    # Per-class F1
+    f1_per_class = f1_score(y_true, y_pred, average=None)
+    for i, name in enumerate(class_names):
+        if i < len(f1_per_class):
+            metrics[f'f1_{name}'] = f1_per_class[i] * 100
+
+    # Matthews Correlation Coefficient
+    metrics['mcc'] = matthews_corrcoef(y_true, y_pred)
+
+    # Jaccard index (macro)
+    metrics['jaccard'] = jaccard_score(y_true, y_pred, average='macro')
+
+    # Cohen's kappa
+    metrics['cohen_kappa'] = cohen_kappa_score(y_true, y_pred)
+
+    # Sensitivity and Specificity (per-class, then macro)
+    cm = confusion_matrix(y_true, y_pred)
+    n_classes = len(class_names)
+    sensitivities, specificities = [], []
+    for i in range(n_classes):
+        tp = cm[i, i]
+        fn = cm[i, :].sum() - tp
+        fp = cm[:, i].sum() - tp
+        tn = cm.sum() - tp - fn - fp
+        sens = tp / (tp + fn + 1e-8)
+        spec = tn / (tn + fp + 1e-8)
+        sensitivities.append(sens)
+        specificities.append(spec)
+        metrics[f'sensitivity_{class_names[i]}'] = sens * 100
+        metrics[f'specificity_{class_names[i]}'] = spec * 100
+
+    metrics['sensitivity_macro'] = np.mean(sensitivities) * 100
+    metrics['specificity_macro'] = np.mean(specificities) * 100
+
+    # AUC-ROC (requires probability scores)
+    if y_proba is not None:
+        try:
+            if n_classes == 2:
+                metrics['auc_roc'] = roc_auc_score(y_true, y_proba[:, 1])
+            else:
+                metrics['auc_roc'] = roc_auc_score(
+                    y_true, y_proba,
+                    multi_class='ovr', average='macro'
+                )
+        except Exception:
+            metrics['auc_roc'] = 0.0
+
+    return metrics
+
+
+def print_metrics(metrics: Dict[str, float], split: str = 'Test') -> None:
+    """Pretty-print metrics in paper format."""
+    print(f"\n{'='*60}")
+    print(f"  {split} Results")
+    print(f"{'='*60}")
+    print(f"  Accuracy:        {metrics.get('accuracy', 0):.2f}%")
+    print(f"  AUC-ROC:         {metrics.get('auc_roc', 0):.4f}")
+    print(f"  MCC:             {metrics.get('mcc', 0):.4f}")
+    print(f"  Jaccard:         {metrics.get('jaccard', 0):.4f}")
+    print(f"  Cohen's κ:       {metrics.get('cohen_kappa', 0):.4f}")
+    print(f"  F1 (macro):      {metrics.get('f1_macro', 0):.2f}%")
+    print(f"  Sensitivity:     {metrics.get('sensitivity_macro', 0):.2f}%")
+    print(f"  Specificity:     {metrics.get('specificity_macro', 0):.2f}%")
+    print(f"{'='*60}")
+
+
+class MetricTracker:
+    """Tracks metrics across epochs and folds."""
+
+    def __init__(self, metric_names: list):
+        self.metric_names = metric_names
+        self.history = {k: [] for k in metric_names}
+
+    def update(self, metrics: Dict[str, float]) -> None:
+        for k in self.metric_names:
+            if k in metrics:
+                self.history[k].append(metrics[k])
+
+    def mean(self) -> Dict[str, float]:
+        return {k: np.mean(v) for k, v in self.history.items() if v}
+
+    def std(self) -> Dict[str, float]:
+        return {k: np.std(v) for k, v in self.history.items() if v}
+
+    def best(self, key: str = 'auc_roc') -> float:
+        vals = self.history.get(key, [0])
+        return max(vals) if vals else 0.0
